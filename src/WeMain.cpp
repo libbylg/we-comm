@@ -1,38 +1,39 @@
-#include "WeComm.h"
+#include "SMQTransport.h"
 
 class WeDispatch
 {
     // Dispatch interface
 public:
-    void Handle(MESSAGE* msg)
+    void HandleMessage(MESSAGE* msg)
     {
         printf("WeDispatch::Handle\n");
     }
 };
 
-class Allocator
-{
-public:
-    WeMessage* Alloc(int size)
-    {
-        return (WeMessage*)((MESSAGE*)std::malloc(sizeof(MESSAGE) + sizeof(size)));
-    }
-
-    void Free(WeMessage* msg)
-    {
-        MESSAGE* m = (MESSAGE*)msg;
-        return std::free(m);
-    }
+struct WeHello {
+    char str[10];
 };
 
 int main(int argc, char* argv[])
 {
     asio::io_context context;
     WeDispatch dispatch;
-    Allocator allocator;
-    WeComm<asio::io_context, WeDispatch, Allocator> comm(context, dispatch, allocator);
-    comm.Setup(TYPE_SERVER, 1, "12");
-    comm.Setup(TYPE_CLIENT, 0, "12");
-    context.run();
+    MessageAllocatorDefault allocator;
+    SMQTransport<asio::io_context, WeDispatch, MessageAllocatorDefault> comm(context, 4096);
+    comm.Init(&dispatch, &allocator);
+
+    //
+    comm.SetupAcceptor("12");
+    comm.SetupConnect("12");
+
+    std::thread t([&context]() { context.run(); });
+
+    MESSAGE* msg = allocator.Alloc(sizeof(WeHello));
+    WeHello* hello = PayloadOf<WeHello>(msg);
+    memcpy(hello->str, "hello", 6);
+    msg->Length(sizeof(WeHello));
+
+    comm.Post(msg);
+    getchar();
     return 0;
 }

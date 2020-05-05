@@ -30,8 +30,5 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
 
 HEADERS += \
-    WeComm.h \
-    WeMessage.h \
-    client.h \
-    message.h \
-    server.h
+    MESSAGE.h \
+    SMQTransport.h
