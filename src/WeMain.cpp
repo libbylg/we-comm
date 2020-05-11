@@ -1,39 +1,79 @@
 #include "SMQTransport.h"
 
+
+struct WeHello {
+    char str[10];
+};
+
 class WeDispatch
 {
     // Dispatch interface
 public:
     void HandleMessage(MESSAGE* msg)
     {
-        printf("WeDispatch::Handle\n");
-    }
-};
+        WeHello* hello = PayloadOf<WeHello*>(msg);
 
-struct WeHello {
-    char str[10];
+        printf("WeDispatch::Handle: '%s'\n", hello->str);
+    }
 };
 
 int main(int argc, char* argv[])
 {
-    asio::io_context context;
+    // asio::io_context context;
     WeDispatch dispatch;
     MessageAllocatorDefault allocator;
-    SMQTransport<asio::io_context, WeDispatch, MessageAllocatorDefault> comm(context, 4096);
-    comm.Init(&dispatch, &allocator);
 
-    //
-    comm.SetupAcceptor("12");
-    comm.SetupConnect("12");
 
-    std::thread t([&context]() { context.run(); });
+    //  启动服务端
+    SMQTransport<WeDispatch, MessageAllocatorDefault> comm1;
+    comm1.Init(11, &dispatch, &allocator, 4096);
+    comm1.SetupAcceptor("12");
+    std::thread t1([&comm1]() {
+        printf("comm1 run\n");
+        comm1.Loop();
+        printf("comm1 run end\n");
+    });
+
+
+    //  启动客户端
+    SMQTransport<WeDispatch, MessageAllocatorDefault> comm2;
+    comm2.Init(22, &dispatch, &allocator, 4096);
+    comm2.SetupConnect("12");
+    std::thread t2([&comm2]() {
+        printf("comm2 run\n");
+        comm2.Loop();
+        printf("comm2 run end\n");
+    });
+
+
+    printf("Enter to send test message...\n");
+    getchar();
+
 
     MESSAGE* msg = allocator.Alloc(sizeof(WeHello));
-    WeHello* hello = PayloadOf<WeHello>(msg);
+    msg->Type(MESSAGE::TYPE_USER);
+    WeHello* hello = PayloadOf<WeHello*>(msg);
     memcpy(hello->str, "hello", 6);
-    msg->Length(sizeof(WeHello));
+    msg->PayloadLength(sizeof(WeHello));
+    msg->Target(22);
 
-    comm.Post(msg);
+    comm1.Post(msg);
+
+    printf("Enter to exit...\n");
     getchar();
     return 0;
 }
+
+//#include "Archive.h"
+//#include "boost/archive/binary_iarchive.hpp"
+//#include "boost/archive/binary_oarchive.hpp"
+//
+// int main(int argc, char* argv[])
+//{
+//    Test t{11, 22};
+//    message_oarchive oar;
+//
+//    oar& t;
+//
+//    return 0;
+//}

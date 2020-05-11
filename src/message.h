@@ -13,22 +13,6 @@
 #endif  // ASSERT
 
 
-template <typename T>
-static inline void list_insert(T* n, T* prev, T* next)
-{
-    n->next = next;
-    n->prev = prev;
-    prev->next = next;
-    next->prev = prev;
-}
-
-template <typename T>
-static inline void list_remove(T* prev, T* next)
-{
-    prev->next = next;
-    next->prev = prev;
-}
-
 struct MESSAGE;
 struct BUFFER;
 
@@ -49,7 +33,7 @@ struct NODE {
 
     inline void push_back(NODE* buf)
     {
-        list_insert(buf, prev, (NODE*)this);
+        insert(buf, prev, (NODE*)this);
     }
 
     inline NODE* pop_front()
@@ -59,19 +43,31 @@ struct NODE {
         }
 
         NODE* front = next;
-        list_remove(front->prev, front->next);
+        remove(front->prev, front->next);
         return front;
+    }
+
+    static inline void insert(NODE* n, NODE* prev, NODE* next)
+    {
+        n->next = next;
+        n->prev = prev;
+        prev->next = n;
+        next->prev = n;
+    }
+
+    static inline void remove(NODE* prev, NODE* next)
+    {
+        prev->next = next;
+        next->prev = prev;
     }
 };
 
 struct BUFFER : public NODE {
     int32_t cap;
-    int32_t padding;
-    int16_t ref;
-    int16_t style;
     uint16_t source;
     uint16_t target;
 };
+static_assert((sizeof(BUFFER) % sizeof(void*) == 0), "make size align");
 
 
 inline MESSAGE* MessageOf(BUFFER* buf)
@@ -91,7 +87,6 @@ inline BUFFER* BufferOf(MESSAGE* msg)
     return (BUFFER*)(((uint8_t*)msg) - sizeof(BUFFER));
 }
 
-
 inline const BUFFER* BufferOf(const MESSAGE* msg)
 {
     return (const BUFFER*)(((uint8_t*)msg) - sizeof(BUFFER));
@@ -99,9 +94,15 @@ inline const BUFFER* BufferOf(const MESSAGE* msg)
 
 
 struct MESSAGE {
-    uint32_t vfl;        //  version(3),flags(5),length(24)
+    uint32_t vtfl;       //  version(2),type(2),flags(4),length(24)
     uint32_t session;    //  session id
     uint8_t payload[0];  //  payload header
+
+    enum : uint32_t {
+        VTFL_VERSION_MASK = 0xC0000000,
+        VTFL_TYPE_MASK = 0x30000000,
+        VTFL_FLAGS_MASK = 0x0F000000,
+    };
 
     enum : uint8_t {
         VERSION = 0x00,
@@ -112,13 +113,75 @@ struct MESSAGE {
     };
 
     enum : uint16_t {
-        ADDR_INVALID = 0xFFFF,
+        ADDRESS_INVALID = 0xFFFF,
     };
 
     enum : uint32_t {
         TOTAL_LENGTH_DEF = 64,
         TOTAL_LENGTH_MAX = 0x00FFFFFF,
     };
+
+    enum : uint8_t {
+        TYPE_USER = 0x00,
+        TYPE_CONN = 0x01,
+    };
+
+    inline uint8_t Version() const
+    {
+        return ((vtfl & VTFL_VERSION_MASK) >> 30);
+    }
+
+    inline void Version(uint8_t ver)
+    {
+        vtfl = (vtfl & ~VTFL_VERSION_MASK) | ((uint32_t(ver) << 30) & VTFL_VERSION_MASK);
+    }
+
+    inline uint8_t Type() const
+    {
+        return ((vtfl & VTFL_TYPE_MASK) >> 28);
+    }
+
+    inline void Type(uint8_t type)
+    {
+        vtfl = (vtfl & ~VTFL_TYPE_MASK) | ((uint32_t(type) << 28) & VTFL_TYPE_MASK);
+    }
+
+    inline uint8_t Flags() const
+    {
+        return ((vtfl & VTFL_FLAGS_MASK) >> 24);
+    }
+
+    inline void Flags(uint8_t flags)
+    {
+        vtfl = (vtfl & ~VTFL_FLAGS_MASK) | ((uint32_t(flags) << 24) & VTFL_FLAGS_MASK);
+    }
+
+    inline int32_t TotalLength() const
+    {
+        return (vtfl & 0x00FFFFFF);
+    }
+
+    inline void TotalLength(uint32_t len)
+    {
+        Q_ASSERT(len < MESSAGE::TOTAL_LENGTH_MAX);
+        vtfl = (vtfl & 0xFF000000) | (len & 0x00FFFFFF);
+    }
+
+    inline int32_t PayloadLength() const
+    {
+        return TotalLength() - sizeof(MESSAGE);
+    }
+
+    inline void PayloadLength(uint32_t len)
+    {
+        TotalLength(len + sizeof(MESSAGE));
+    }
+
+    MESSAGE& FillHeader(struct MESSAGE& header)
+    {
+        std::memcpy(this, &header, sizeof(header));
+        return *this;
+    }
 
     inline uint16_t Source() const
     {
@@ -132,41 +195,22 @@ struct MESSAGE {
         buf->source = s;
     }
 
-    inline uint8_t Version() const
+    inline uint16_t Target() const
     {
-        return (vfl >> 29);
+        const BUFFER* buf = BufferOf(this);
+        return buf->target;
     }
 
-    inline void Version(uint8_t ver)
+    inline void Target(uint16_t s)
     {
-        vfl = (vfl & 0x3FFFFFFF) | ((uint32_t(ver) << 29) & 0xE0000000);
+        BUFFER* buf = BufferOf(this);
+        buf->target = s;
     }
 
-    inline uint8_t Flags() const
+    inline int32_t Cap() const
     {
-        return ((vfl & 0x1F000000) >> 24);
-    }
-
-    inline void Flags(uint8_t flags)
-    {
-        vfl = (vfl & 0xEFFFFFFF) | ((uint32_t(flags) << 24) & 0x30000000);
-    }
-
-    inline int32_t Length() const
-    {
-        return (vfl & 0x00FFFFFF);
-    }
-
-    inline void Length(uint32_t len)
-    {
-        Q_ASSERT(len < MESSAGE::TOTAL_LENGTH_MAX);
-        vfl = (vfl & 0xFF000000) | (len & 0x00FFFFFF);
-    }
-
-    MESSAGE& FillHeader(struct MESSAGE& header)
-    {
-        std::memcpy(this, &header, sizeof(header));
-        return *this;
+        const BUFFER* buf = BufferOf(this);
+        return buf->cap;
     }
 
     void Reset()
@@ -177,26 +221,10 @@ struct MESSAGE {
 };
 
 template <typename T>
-inline T* PayloadOf(MESSAGE* msg)
+inline T PayloadOf(MESSAGE* msg)
 {
-    return (T*)(msg->payload);
+    return (T)(msg->payload);
 }
-
-
-struct WeConnAuth {
-    uint8_t tl;       //  type & length
-    char padding[3];  //  name of the command
-
-    uint8_t Type() const
-    {
-        return (tl >> 5);
-    }
-
-    uint8_t CmdNameLen() const
-    {
-        return (tl & 0x1F);
-    }
-};
 
 
 struct Interface {
