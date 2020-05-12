@@ -177,7 +177,7 @@ struct MESSAGE {
         TotalLength(len + sizeof(MESSAGE));
     }
 
-    MESSAGE& FillHeader(struct MESSAGE& header)
+    MESSAGE& FillHeader(const MESSAGE& header)
     {
         std::memcpy(this, &header, sizeof(header));
         return *this;

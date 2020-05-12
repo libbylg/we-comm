@@ -17,6 +17,11 @@ enum EndpointType {
     TYPE_SERVER = 1,
 };
 
+struct Stream {
+    virtual void update_status(uint16_t mask, uint16_t val) = 0;
+    virtual void current_status(uint16_t mask) = 0;
+    virtual void async_write(MESSAGE* msg) = 0;
+};
 
 template <typename DISPATCHER, typename ALLOCATOR>
 class SMQTransport
@@ -45,11 +50,13 @@ private:
     struct stream_t : public NODE {
         asio::ip::tcp::socket socket;
         chan_t* chan;     //  绑定到哪个通道
-        MESSAGE* rcur;    //  当前还未收取完成的消息
         BUFFER* wcur;     //  当前正在发送的消息(当wcur为null时,表示需要重启)
+        MESSAGE* rcur;    //  当前还未收取完成的消息
+        MESSAGE rbuf;     //  消息头缓冲区
+        int16_t rhead;    //  是否正在读取消息头
+        uint16_t wloss;   //  是否处于写丢失状态
         uint16_t target;  //  流的目的地址
         uint16_t status;  //  当前状态
-        uint32_t wloss;   //  是否处于写丢失状态
 
         stream_t(asio::ip::tcp::socket sock) : socket(std::move(sock))
         {
@@ -58,6 +65,7 @@ private:
             wcur = nullptr;
             target = MESSAGE::ADDRESS_INVALID;
             status = STATUS_CONN_IDLE | STATUS_PROTOCOL_IDLE;
+            rhead = true;
             wloss = true;
         }
 
@@ -192,10 +200,12 @@ protected:
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTED);
         // stream->update_status(STATUS_CONN_MASK, STATUS_CONN_CONNECTED);
 
-        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
-                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-                             HandleReadHeader(stream, ec, length);
-                         });
+        stream->rhead = true;
+        async_read(stream);
+        //        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
+        //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
+        //                             HandleReadHeader(stream, ec, length);
+        //                         });
 
         padding.push_back(stream);
     }
@@ -217,61 +227,86 @@ protected:
             Q_ASSERT(nullptr != stream->rcur);
         }
 
-        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
-                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-                             HandleReadHeader(stream, ec, length);
-                         });
+        stream->rhead = true;
+        async_read(stream);
+        //        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
+        //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
+        //                             HandleReadHeader(stream, ec, length);
+        //                         });
     }
 
-    void HandleReceiveResult(stream_t* stream, const system::error_code& err, std::size_t length)
-    {
-    }
-
-    void HandleReadHeader(stream_t* stream, const system::error_code& err, std::size_t length)
+    void HandleReadResult(stream_t* stream, const system::error_code& err, std::size_t length)
     {
         if (err) {
-            debug(stream, "HandleReadHeader failed:%d", err.value());
+            debug(stream, "HandleReadResult failed:%d", err.value());
             return;
         }
-        debug(stream, "HandleReadHeader success");
+        debug(stream, "HandleReadResult success");
 
-        //  确保缓冲区足够大,如果运气足够好,那么不需要额外搬移数据
-        uint32_t rcurLen = stream->rcur->TotalLength();
-        if (rcurLen > BufferOf(stream->rcur)->cap) {
+        if (stream->rhead) {
+            uint32_t rcurLen = stream->rbuf.TotalLength();
             auto oldrcur = stream->rcur;
             auto newrcur = allocator->Alloc(rcurLen);
-            newrcur->FillHeader(*oldrcur);
+            newrcur->FillHeader(stream->rbuf);
             stream->rcur = newrcur;
-            allocator->Free(stream->rcur);
-        }
 
-        asio::async_read(stream->socket,
-                         asio::buffer(stream->rcur->payload, (stream->rcur->TotalLength() - sizeof(MESSAGE))),
-                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-                             HandleReadBody(stream, ec, length);
-                         });
+            stream->rhead = false;
+            async_read(stream);
+
+        } else {
+            HandleMessage(stream, stream->rcur);
+            stream->rcur = nullptr;
+
+            stream->rhead = true;
+            async_read(stream);
+        }
     }
 
-    void HandleReadBody(stream_t* stream, const system::error_code& err, std::size_t length)
-    {
-        if (err) {
-            debug(stream, "HandleReadBody failed:%d", err.value());
-            return;
-        }
-        debug(stream, "HandleReadBody success");
+    //    void HandleReadHeader(stream_t* stream, const system::error_code& err, std::size_t length)
+    //    {
+    //        if (err) {
+    //            debug(stream, "HandleReadHeader failed:%d", err.value());
+    //            return;
+    //        }
+    //        debug(stream, "HandleReadHeader success");
+    //
+    //        //  确保缓冲区足够大,如果运气足够好,那么不需要额外搬移数据
+    //        uint32_t rcurLen = stream->rcur->TotalLength();
+    //        if (rcurLen > BufferOf(stream->rcur)->cap) {
+    //            auto oldrcur = stream->rcur;
+    //            auto newrcur = allocator->Alloc(rcurLen);
+    //            newrcur->FillHeader(*oldrcur);
+    //            stream->rcur = newrcur;
+    //            allocator->Free(stream->rcur);
+    //        }
+    //
+    //        asio::async_read(stream->socket,
+    //                         asio::buffer(stream->rcur->payload, (stream->rcur->TotalLength() - sizeof(MESSAGE))),
+    //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
+    //                             HandleReadBody(stream, ec, length);
+    //                         });
+    //    }
 
-        HandleMessage(stream, stream->rcur);
-
-        auto oldrcur = stream->rcur;
-        stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
-        Q_ASSERT(nullptr != stream->rcur);
-
-        allocator->Free(oldrcur);
-        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
-                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-                             HandleReadHeader(stream, ec, length);
-                         });
-    }
+    //    void HandleReadBody(stream_t* stream, const system::error_code& err, std::size_t length)
+    //    {
+    //        if (err) {
+    //            debug(stream, "HandleReadBody failed:%d", err.value());
+    //            return;
+    //        }
+    //        debug(stream, "HandleReadBody success");
+    //
+    //        HandleMessage(stream, stream->rcur);
+    //
+    //        auto oldrcur = stream->rcur;
+    //        stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
+    //        Q_ASSERT(nullptr != stream->rcur);
+    //
+    //        allocator->Free(oldrcur);
+    //        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
+    //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
+    //                             HandleReadHeader(stream, ec, length);
+    //                         });
+    //    }
 
     void HandleWriteResult(stream_t* stream, const system::error_code& err, std::size_t length)
     {
@@ -321,12 +356,20 @@ protected:
     }
 
     //  启动异步发送
-    void async_receive(stream_t* stream)
+    void async_read(stream_t* stream)
     {
-        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
-                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-                             HandleReadHeader(stream, ec, length);
-                         });
+        if (true == stream->rhead) {
+            asio::async_read(stream->socket, asio::buffer(&(stream->rbuf), sizeof(stream->rbuf)),
+                             [this, stream](const boost::system::error_code& ec, std::size_t length) {
+                                 HandleReadResult(stream, ec, length);
+                             });
+        } else {
+            asio::async_read(stream->socket,
+                             asio::buffer(stream->rcur->payload, (stream->rcur->TotalLength() - sizeof(MESSAGE))),
+                             [this, stream](const boost::system::error_code& ec, std::size_t length) {
+                                 HandleReadResult(stream, ec, length);
+                             });
+        }
     }
 
     int debug(stream_t* stream, const char* format, ...)
@@ -366,8 +409,9 @@ protected:
         uint16_t source;
     };
 
-    void PostAuth(stream_t* stream)
+    void PostAuth(void* s)
     {
+        stream_t* stream = (stream_t*)s;
         debug(stream, "PostAuth");
         MESSAGE* msg = allocator->Alloc(sizeof(MESSAGE) + sizeof(CONNAUTHMsg));
         Q_ASSERT(nullptr != msg);
@@ -384,8 +428,9 @@ protected:
         async_write(stream);
     }
 
-    void PostAuthAck(stream_t* stream)
+    void PostAuthAck(void* s)
     {
+        stream_t* stream = (stream_t*)s;
         debug(stream, "PostAuthAck");
         MESSAGE* msg = allocator->Alloc(sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg));
         Q_ASSERT(nullptr != msg);
@@ -403,8 +448,9 @@ protected:
         async_write(stream);
     }
 
-    void HandleConnMessage(stream_t* stream, MESSAGE* msg)
+    void HandleConnMessage(void* s, MESSAGE* msg)
     {
+        stream_t* stream = (stream_t*)s;
         Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNHEAD)));
         CONNHEAD* head = PayloadOf<CONNHEAD*>(msg);
         switch (head->code) {
@@ -432,14 +478,16 @@ protected:
         }
     }
 
-    void BindStreamChan(stream_t* stream, chan_t* chan)
+    void BindStreamChan(void* s, chan_t* chan)
     {
+        stream_t* stream = (stream_t*)s;
         stream->chan = chan;
         chan->stream = stream;
     }
 
-    void UpdateStatus(stream_t* stream, uint16_t mask, uint16_t val)
+    virtual void UpdateStatus(void* s, uint16_t mask, uint16_t val)
     {
+        stream_t* stream = (stream_t*)s;
         uint16_t oldstatus = (stream->status & mask);
         stream->update_status(mask, val);
         uint16_t newstatus = (stream->status & mask);
@@ -449,8 +497,9 @@ protected:
         }
     }
 
-    void HandleEvent(stream_t* stream, uint16_t event, uintptr_t param1, uintptr_t param2)
+    virtual void HandleEvent(void* s, uint16_t event, uintptr_t param1, uintptr_t param2)
     {
+        stream_t* stream = (stream_t*)s;
         if (EVENT_CONN_STATUS_CHANGED == event) {
             if ((param1 == STATUS_CONN_CONNECTING) && (param2 == STATUS_CONN_CONNECTED)) {
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_WAITAUTH);
@@ -459,14 +508,15 @@ protected:
         }
     }
 
-    void HandleMessage(stream_t* stream, MESSAGE* msg)
+    virtual void HandleMessage(void* s, MESSAGE* msg)
     {
+        stream_t* stream = (stream_t*)(s);
         switch (msg->Type()) {
             case MESSAGE::TYPE_CONN:
                 HandleConnMessage(stream, msg);
                 break;
             case MESSAGE::TYPE_USER:
-                dispatcher->HandleMessage(msg);
+                dispatcher->HandleMessage(stream, msg);
                 break;
             default:
                 Q_ASSERT(false);

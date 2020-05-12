@@ -5,11 +5,14 @@ struct WeHello {
     char str[10];
 };
 
-class WeDispatch
+class WeProtocol
 {
     // Dispatch interface
 public:
-    void HandleMessage(MESSAGE* msg)
+    virtual void HandleEvent(void* stream, uint16_t event, uintptr_t param1, uintptr_t param2)
+    {
+    }
+    virtual void HandleMessage(void* stream, MESSAGE* msg)
     {
         WeHello* hello = PayloadOf<WeHello*>(msg);
 
@@ -20,12 +23,12 @@ public:
 int main(int argc, char* argv[])
 {
     // asio::io_context context;
-    WeDispatch dispatch;
+    WeProtocol dispatch;
     MessageAllocatorDefault allocator;
 
 
     //  启动服务端
-    SMQTransport<WeDispatch, MessageAllocatorDefault> comm1;
+    SMQTransport<WeProtocol, MessageAllocatorDefault> comm1;
     comm1.Init(11, &dispatch, &allocator, 4096);
     comm1.SetupAcceptor("12");
     std::thread t1([&comm1]() {
@@ -36,7 +39,7 @@ int main(int argc, char* argv[])
 
 
     //  启动客户端
-    SMQTransport<WeDispatch, MessageAllocatorDefault> comm2;
+    SMQTransport<WeProtocol, MessageAllocatorDefault> comm2;
     comm2.Init(22, &dispatch, &allocator, 4096);
     comm2.SetupConnect("12");
     std::thread t2([&comm2]() {
