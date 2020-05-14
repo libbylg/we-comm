@@ -24,12 +24,21 @@ enum : uint16_t {
     STATUS_CONN_CLEANING = 0x2000,      //  正在清理链接
     STATUS_CONN_CONNECTED = 0x3000,     //  连接成功
     STATUS_CONN_DISCONNECTED = 0x4000,  //  已经断开
+    STATUS_CONN_ERROR = 0x5000,         //  已经异常
+};
 
+enum : uint16_t {
     STATUS_PROTOCOL_MASK = 0x000F,      //  协议状态掩码:  ***-****|****-XXXX
-    STATUS_PROTOCOL_IDLE = 0x0000,      //  等待认证
+    STATUS_PROTOCOL_IDLE = 0x0000,      //  刚初始化
     STATUS_PROTOCOL_WAITAUTH = 0x0001,  //  等待认证
     STATUS_PROTOCOL_READY = 0x0002,     //  认证成功
     STATUS_PROTOCOL_ERROR = 0x000F,     //  协议异常
+};
+
+enum : uint16_t {
+    ATTR_STREAM_TYPE_MASK = 0x0001,      //  连接类型掩码
+    ATTR_STREAM_TYPE_ACTIVATE = 0x0000,  //  主动发起的连接
+    ATTR_STREAM_TYPE_PASSIVES = 0x0001,  //  被动建立的连接
 };
 
 enum : int32_t {
@@ -37,12 +46,42 @@ enum : int32_t {
     EVENT_CONN_STATUS_CHANGED,
 };
 
+enum : int32_t {
+    ACTION_NONE,
+    ACTION_DISCONNECT,  //  执行断链
+    ACTION_RECONNECT,   //  执行重连
+};
+
 
 struct SMQStream {
     virtual void update_status(uint16_t mask, uint16_t val) = 0;
-    virtual uint16_t current_status(uint16_t mask) = 0;
+    virtual uint16_t current_status(uint16_t mask) const = 0;
+    virtual uint16_t get_attr(uint16_t mask) const = 0;
     //    virtual void async_write(MESSAGE* msg) = 0;
 };
+
+static inline asio::ip::tcp::endpoint addr_of(const std::string& str)
+{
+    std::string host;
+    unsigned short port;
+    int pos = str.find_last_of(":");
+    if (pos < 0) {
+        host = str;
+        port = 9090;
+    } else {
+        host = str.substr(0, pos);
+        port = atoi(str.substr(pos + 1).c_str());
+    }
+
+    return asio::ip::tcp::endpoint(asio::ip::make_address(host), port);
+}
+
+static inline std::string str_of(const asio::ip::tcp::endpoint& ep)
+{
+    char buf[10] = {0};
+    snprintf(buf, sizeof(buf), "%d", ep.port());
+    return ep.address().to_string().append(":").append(buf);
+}
 
 template <typename TRANSPORT, typename DISPATCHER, typename ALLOCATOR>
 class SMQProtocol
@@ -71,7 +110,7 @@ protected:
         Q_ASSERT(nullptr != msg);
         CONNAUTHMsg* auth = PayloadOf<CONNAUTHMsg*>(msg);
         auth->code = CONNAUTH;
-        auth->source = ((TRANSPORT*)this)->source;
+        auth->source = source;
         msg->TotalLength(sizeof(MESSAGE) + sizeof(CONNAUTHMsg));
         msg->Type(MESSAGE::TYPE_CONN);
 
@@ -93,10 +132,6 @@ protected:
         auth->source = ((TRANSPORT*)this)->source;
         msg->TotalLength(sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg));
         msg->Type(MESSAGE::TYPE_CONN);
-
-        //        ((TRANSPORT*)this)->debug(stream, "assert pos");
-        //        Q_ASSERT(nullptr == stream->wcur);
-        //        stream->wcur = BufferOf(msg);
 
         //  启动异步发送
         ((TRANSPORT*)this)->async_write(stream, msg);
@@ -138,8 +173,9 @@ protected:
         return 0;
     }
 
-    virtual void HandleEvent(void* s, uint16_t event, uintptr_t param1, uintptr_t param2)
+    virtual void HandleEvent(void* s, uint32_t& action, uint16_t event, uintptr_t param1, uintptr_t param2)
     {
+        std::printf("HandleEvent: event=%d, [%llu, %llu]\n", event, param1, param2);
         SMQStream* stream = (SMQStream*)s;
         if (EVENT_CONN_INITED == event) {
             stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_IDLE);
@@ -149,6 +185,16 @@ protected:
             if ((param1 == STATUS_CONN_CONNECTING) && (param2 == STATUS_CONN_CONNECTED)) {
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_WAITAUTH);
                 PostAuth(stream);
+            }
+
+            if ((param1 != STATUS_CONN_DISCONNECTED) && (param2 == STATUS_CONN_DISCONNECTED)) {
+                stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_IDLE);
+                if (ATTR_STREAM_TYPE_ACTIVATE == stream->get_attr(ATTR_STREAM_TYPE_MASK)) {
+                    action = ACTION_RECONNECT;
+                    std::printf("Disconnected, try reconnect\n");
+                } else {
+                    action = ACTION_DISCONNECT;
+                }
             }
         }
     }
@@ -187,12 +233,16 @@ private:
         BUFFER* wcur;     //  当前正在发送的消息(当wcur为null时,表示需要重启)
         MESSAGE* rcur;    //  当前还未收取完成的消息
         MESSAGE rbuf;     //  消息头缓冲区
-        int16_t rhead;    //  是否正在读取消息头
-        uint16_t wloss;   //  是否处于写丢失状态
+        int8_t rhead;     //  是否正在读取消息头
+        uint8_t wloss;    //  是否处于写丢失状态
+        uint16_t attr;    //  属性
         uint16_t target;  //  流的目的地址
         uint16_t status;  //  当前状态
+        std::string targetAddr;
+        boost::asio::deadline_timer* timer;
 
-        stream_t(asio::ip::tcp::socket sock) : socket(std::move(sock))
+        stream_t(asio::ip::tcp::socket sock, const std::string& addr, uint16_t attr = 0)
+            : socket(std::move(sock)), attr(attr)
         {
             chan = nullptr;
             rcur = nullptr;
@@ -201,6 +251,8 @@ private:
             status = STATUS_CONN_IDLE;
             rhead = true;
             wloss = true;
+            targetAddr = addr;
+            timer = nullptr;
         }
 
         virtual void update_status(uint16_t mask, uint16_t val) override
@@ -208,9 +260,14 @@ private:
             status = (status & ~mask) | (val & mask);
         }
 
-        virtual uint16_t current_status(uint16_t mask) override
+        virtual uint16_t current_status(uint16_t mask) const override
         {
             return (status & mask);
+        }
+
+        virtual uint16_t get_attr(uint16_t mask) const override
+        {
+            return (attr & mask);
         }
     };
 
@@ -255,18 +312,16 @@ public:
 
     int SetupConnect(const std::string& saddr)
     {
+        // asio::ip::tcp::socket;
+        auto stream = new stream_t(std::move(asio::ip::tcp::socket(context)), saddr, ATTR_STREAM_TYPE_ACTIVATE);
+
         asio::ip::tcp::resolver resolver(context);
         auto endpoints = resolver.resolve(std::string("localhost"), std::string("9090"));
-
-        // asio::ip::tcp::socket;
-        auto stream = new stream_t(std::move(asio::ip::tcp::socket(context)));
-
         padding.push_back(stream);
-        this->HandleEvent(stream, EVENT_CONN_INITED, 0, 0);
-
+        uint32_t action = ACTION_NONE;
+        this->HandleEvent(stream, action, EVENT_CONN_INITED, 0, 0);
 
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTING);
-        // stream->update_status(STATUS_CONN_MASK, STATUS_CONN_CONNECTING);
 
         asio::async_connect(stream->socket, endpoints,
                             [this, stream](const system::error_code& ec, asio::ip::tcp::endpoint ep) {
@@ -280,14 +335,29 @@ public:
         asio::ip::tcp::resolver resolver(context);
         auto endpoints = resolver.resolve(std::string("localhost"), std::string("9090"));
 
+        //        auto endpoints = addr_of(saddr);
+
         Q_ASSERT(nullptr == acceptor);
-        auto accept = new asio::ip::tcp::acceptor(context, *endpoints.begin());
-        Q_ASSERT(nullptr != accept);
+        asio::ip::tcp::acceptor* accept = nullptr;
+        try {
+            accept = new asio::ip::tcp::acceptor(context, *endpoints.begin());
+        } catch (boost::system::system_error err) {
+            std::printf("Listen port '%s' failed: %s\n", saddr.c_str(), err.what());
+            return -1;
+        }
+
         acceptor = accept;
+
         accept->async_accept([this, accept](const system::error_code& ec, asio::ip::tcp::socket sock) {
             HandleAcceptResult(accept, ec, std::move(sock));
         });
         return 0;
+    }
+
+    uint16_t get_attr(void* s, uint16_t mask)
+    {
+        stream_t* stream = (stream_t*)s;
+        return (stream->attr & mask);
     }
 
     int Post(MESSAGE* msg)
@@ -328,59 +398,64 @@ public:
     void HandleConnectResult(stream_t* stream, const system::error_code& err, asio::ip::tcp::endpoint ep)
     {
         if (err) {
-            debug(stream, "HandleConnect failed:%d", err.value());
+            debug(stream, "%p:HandleConnect failed:%d: %s", stream, err.value(),
+                  err.message().c_str());  // TODO 错误码是啥
+            if (nullptr == stream->timer) {
+                stream->timer = new boost::asio::deadline_timer(context, boost::posix_time::seconds(5));
+            }
+            stream->timer->async_wait([this, stream](boost::system::error_code err) {
+                std::printf("timeout - try reconnnect\n");
+                stream->timer->cancel();
+                this->async_connect(stream);
+            });
             return;
         }
-        debug(stream, "HandleConnect success");
-
-        //        if (nullptr == stream->rcur) {
-        //            stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
-        //            Q_ASSERT(nullptr != stream->rcur);
-        //        }
+        debug(stream, "HandleConnect success: %s", ep.address().to_string().c_str());
 
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTED);
-        // stream->update_status(STATUS_CONN_MASK, STATUS_CONN_CONNECTED);
 
         stream->rhead = true;
         async_read(stream);
-        //        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
-        //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-        //                             HandleReadHeader(stream, ec, length);
-        //                         });
-
         padding.push_back(stream);
     }
 
     void HandleAcceptResult(asio::ip::tcp::acceptor* a, const system::error_code& err, asio::ip::tcp::socket sock)
     {
         if (err) {
-            std::printf("HandleAccept failed:%d\n", err.value());
+            debug(nullptr, "HandleAcceptResult failed:%d: %s", err.value(), err.message().c_str());  // TODO 错误码是啥
             return;
         }
         std::printf("HandleAccept success\n");
 
-        auto stream = new stream_t(std::move(sock));
+        std::string saddr;
+        system::error_code ec;
+        auto endpoint = sock.remote_endpoint(ec);
+        if (ec) {
+            std::printf("HandleAccept : can not get the remote endpoint:%d:  %s\n", ec.value(), ec.message().c_str());
+            saddr = str_of(endpoint);
+        }
+
+        auto stream = new stream_t(std::move(sock), saddr, ATTR_STREAM_TYPE_PASSIVES);
 
         padding.push_back(stream);
-        this->HandleEvent(stream, EVENT_CONN_INITED, 0, 0);
-
-        //        if (nullptr == stream->rcur) {
-        //            stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
-        //            Q_ASSERT(nullptr != stream->rcur);
-        //        }
+        uint32_t action = ACTION_NONE;
+        this->HandleEvent(stream, action, EVENT_CONN_INITED, 0, 0);
 
         stream->rhead = true;
         async_read(stream);
-        //        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
-        //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-        //                             HandleReadHeader(stream, ec, length);
-        //                         });
     }
 
     void HandleReadResult(stream_t* stream, const system::error_code& err, std::size_t length)
     {
+        if ((boost::asio::error::eof == err) || (boost::asio::error::connection_reset == err)) {
+            debug(stream, "HandleReadResult failed:%d: %s", err.value(), err.message().c_str());  // TODO 错误码是啥
+            UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_DISCONNECTED);
+            return;
+        }
+
         if (err) {
-            debug(stream, "HandleReadResult failed:%d", err.value());
+            debug(stream, "HandleReadResult failed:%d: %s", err.value(), err.message().c_str());  // TODO 错误码是啥
+            UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_DISCONNECTED);
             return;
         }
         debug(stream, "HandleReadResult success");
@@ -404,56 +479,17 @@ public:
         }
     }
 
-    //    void HandleReadHeader(stream_t* stream, const system::error_code& err, std::size_t length)
-    //    {
-    //        if (err) {
-    //            debug(stream, "HandleReadHeader failed:%d", err.value());
-    //            return;
-    //        }
-    //        debug(stream, "HandleReadHeader success");
-    //
-    //        //  确保缓冲区足够大,如果运气足够好,那么不需要额外搬移数据
-    //        uint32_t rcurLen = stream->rcur->TotalLength();
-    //        if (rcurLen > BufferOf(stream->rcur)->cap) {
-    //            auto oldrcur = stream->rcur;
-    //            auto newrcur = allocator->Alloc(rcurLen);
-    //            newrcur->FillHeader(*oldrcur);
-    //            stream->rcur = newrcur;
-    //            allocator->Free(stream->rcur);
-    //        }
-    //
-    //        asio::async_read(stream->socket,
-    //                         asio::buffer(stream->rcur->payload, (stream->rcur->TotalLength() - sizeof(MESSAGE))),
-    //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-    //                             HandleReadBody(stream, ec, length);
-    //                         });
-    //    }
-
-    //    void HandleReadBody(stream_t* stream, const system::error_code& err, std::size_t length)
-    //    {
-    //        if (err) {
-    //            debug(stream, "HandleReadBody failed:%d", err.value());
-    //            return;
-    //        }
-    //        debug(stream, "HandleReadBody success");
-    //
-    //        HandleMessage(stream, stream->rcur);
-    //
-    //        auto oldrcur = stream->rcur;
-    //        stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
-    //        Q_ASSERT(nullptr != stream->rcur);
-    //
-    //        allocator->Free(oldrcur);
-    //        asio::async_read(stream->socket, asio::buffer(stream->rcur, sizeof(MESSAGE)),
-    //                         [this, stream](const boost::system::error_code& ec, std::size_t length) {
-    //                             HandleReadHeader(stream, ec, length);
-    //                         });
-    //    }
-
     void HandleWriteResult(stream_t* stream, const system::error_code& err, std::size_t length)
     {
+        if ((boost::asio::error::eof == err) || (boost::asio::error::connection_reset == err)) {
+            debug(stream, "HandleWriteResult failed:%d: %s", err.value(), err.message().c_str());  // TODO 错误码是啥
+            UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_DISCONNECTED);
+            return;
+        }
+
         if (err) {
-            debug(stream, "HandleWriteResult failed:%d", err.value());
+            debug(stream, "HandleWriteResult failed:%d: %s", err.value(), err.message().c_str());  // TODO 错误码是啥
+            stream->socket.close();
             stream->wloss = true;
             return;
         }
@@ -523,10 +559,31 @@ public:
         }
     }
 
+    void async_connect(stream_t* stream)
+    {
+        asio::ip::tcp::resolver resolver(context);
+        //        asio::ip::tcp::endpoint ep = addr_of(stream->targetAddr);
+
+        auto endpoints = resolver.resolve(std::string("localhost"), std::string("9090"));
+
+        padding.push_back(stream);
+        uint32_t action = ACTION_NONE;
+        this->HandleEvent(stream, action, EVENT_CONN_INITED, 0, 0);
+
+        UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTING);
+
+        asio::async_connect(stream->socket, endpoints,
+                            [this, stream](const system::error_code& ec, asio::ip::tcp::endpoint ep) {
+                                HandleConnectResult(stream, ec, ep);
+                            });
+    }
+
     int debug(stream_t* stream, const char* format, ...)
     {
         // std::printf("[%p][%d-%d]", stream, source, stream->target);
-        std::printf("[%p][??-%d]", stream, stream->target);
+        if (nullptr != stream) {
+            std::printf("[%p][??-%d]", stream, stream->target);
+        }
         va_list valist;
         va_start(valist, format);
         std::vprintf(format, valist);
@@ -565,7 +622,15 @@ public:
         uint16_t newstatus = (stream->status & mask);
 
         if (oldstatus != newstatus) {
-            this->HandleEvent(stream, EVENT_CONN_STATUS_CHANGED, oldstatus, newstatus);
+            uint32_t action = ACTION_NONE;
+            this->HandleEvent(stream, action, EVENT_CONN_STATUS_CHANGED, oldstatus, newstatus);
+            if (action == ACTION_DISCONNECT) {
+                stream->socket.close();
+            }
+            if (action == ACTION_RECONNECT) {
+                stream->socket.close();
+                async_connect(stream);
+            }
         }
     }
 

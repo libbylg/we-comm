@@ -22,45 +22,57 @@ public:
 
 int main(int argc, char* argv[])
 {
-    // asio::io_context context;
+    if (argc < 2) {
+        printf("we-comm client\n");
+        printf("we-comm server\n");
+        return 0;
+    }
+
     WeProtocol dispatch;
     MessageAllocatorDefault allocator;
-
+    auto comm = new SMQTransport<WeProtocol, MessageAllocatorDefault>();
+    std::thread thread;
+    uint16_t target = 0;
 
     //  启动服务端
-    SMQTransport<WeProtocol, MessageAllocatorDefault> comm1;
-    comm1.Init(11, &dispatch, &allocator, 4096);
-    comm1.SetupAcceptor("12");
-    std::thread t1([&comm1]() {
-        printf("comm1 run\n");
-        comm1.Loop();
-        printf("comm1 run end\n");
-    });
+    if (0 == strcmp(argv[1], "server")) {
+        comm->Init(11, &dispatch, &allocator, 4096);
+        comm->SetupAcceptor("localhost:9090");
+        thread = std::thread([comm]() {
+            printf("comm1 run\n");
+            comm->Loop();
+            printf("comm1 run end\n");
+        });
+        target = 22;
+    }
 
 
     //  启动客户端
-    SMQTransport<WeProtocol, MessageAllocatorDefault> comm2;
-    comm2.Init(22, &dispatch, &allocator, 4096);
-    comm2.SetupConnect("12");
-    std::thread t2([&comm2]() {
-        printf("comm2 run\n");
-        comm2.Loop();
-        printf("comm2 run end\n");
-    });
+    if (0 == strcmp(argv[1], "client")) {
+        comm->Init(22, &dispatch, &allocator, 4096);
+        comm->SetupConnect("localhost:9090");
+        thread = std::thread([comm]() {
+            printf("comm2 run\n");
+            comm->Loop();
+            printf("comm2 run end\n");
+        });
+        target = 11;
+    }
 
 
-    printf("Enter to send test message...\n");
-    getchar();
+    while (1) {
+        printf("Enter to send test message...\n");
+        getchar();
 
 
-    MESSAGE* msg = allocator.Alloc(sizeof(WeHello));
-    msg->Type(MESSAGE::TYPE_USER);
-    WeHello* hello = PayloadOf<WeHello*>(msg);
-    memcpy(hello->str, "hello", 6);
-    msg->PayloadLength(sizeof(WeHello));
-    msg->Target(22);
-
-    comm1.Post(msg);
+        MESSAGE* msg = allocator.Alloc(sizeof(WeHello));
+        msg->Type(MESSAGE::TYPE_USER);
+        WeHello* hello = PayloadOf<WeHello*>(msg);
+        memcpy(hello->str, "hello", 6);
+        msg->PayloadLength(sizeof(WeHello));
+        msg->Target(target);
+        comm->Post(msg);
+    }
 
     printf("Enter to exit...\n");
     getchar();
