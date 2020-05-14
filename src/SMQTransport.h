@@ -50,6 +50,7 @@ enum : int32_t {
     ACTION_NONE,
     ACTION_DISCONNECT,  //  执行断链
     ACTION_RECONNECT,   //  执行重连
+    ACTION_REFUSE,      //  不接受新连接
 };
 
 
@@ -401,8 +402,11 @@ public:
             debug(stream, "%p:HandleConnect failed:%d: %s", stream, err.value(),
                   err.message().c_str());  // TODO 错误码是啥
             if (nullptr == stream->timer) {
-                stream->timer = new boost::asio::deadline_timer(context, boost::posix_time::seconds(5));
+                // stream->timer = new boost::asio::deadline_timer(context, boost::posix_time::seconds(5));
+                stream->timer = new boost::asio::deadline_timer(context);
             }
+
+            stream->timer->expires_from_now(boost::posix_time::seconds(5));
             stream->timer->async_wait([this, stream](boost::system::error_code err) {
                 std::printf("timeout - try reconnnect\n");
                 stream->timer->cancel();
@@ -411,6 +415,13 @@ public:
             return;
         }
         debug(stream, "HandleConnect success: %s", ep.address().to_string().c_str());
+
+        if (nullptr != stream->timer) {
+            boost::asio::deadline_timer* timer = stream->timer;
+            // stream->timer = nullptr;
+            timer->cancel();
+            // delete timer;
+        }
 
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTED);
 
@@ -443,6 +454,11 @@ public:
 
         stream->rhead = true;
         async_read(stream);
+
+        //  accept others connections
+        acceptor->async_accept([this](const system::error_code& ec, asio::ip::tcp::socket sock) {
+            HandleAcceptResult(this->acceptor, ec, std::move(sock));
+        });
     }
 
     void HandleReadResult(stream_t* stream, const system::error_code& err, std::size_t length)

@@ -60,6 +60,7 @@ int main(int argc, char* argv[])
     }
 
 
+    int counter = 1;
     while (1) {
         printf("Enter to send test message...\n");
         getchar();
@@ -68,7 +69,8 @@ int main(int argc, char* argv[])
         MESSAGE* msg = allocator.Alloc(sizeof(WeHello));
         msg->Type(MESSAGE::TYPE_USER);
         WeHello* hello = PayloadOf<WeHello*>(msg);
-        memcpy(hello->str, "hello", 6);
+
+        snprintf(hello->str, 6, "he%d", counter++);
         msg->PayloadLength(sizeof(WeHello));
         msg->Target(target);
         comm->Post(msg);
