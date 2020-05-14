@@ -17,37 +17,171 @@ enum EndpointType {
     TYPE_SERVER = 1,
 };
 
-struct Stream {
-    virtual void update_status(uint16_t mask, uint16_t val) = 0;
-    virtual void current_status(uint16_t mask) = 0;
-    virtual void async_write(MESSAGE* msg) = 0;
+enum : uint16_t {
+    STATUS_CONN_MASK = 0xF000,          //  连接状态掩码: XXXX-****|****-****
+    STATUS_CONN_IDLE = 0x0000,          //  已经断开
+    STATUS_CONN_CONNECTING = 0x1000,    //  正在连接
+    STATUS_CONN_CLEANING = 0x2000,      //  正在清理链接
+    STATUS_CONN_CONNECTED = 0x3000,     //  连接成功
+    STATUS_CONN_DISCONNECTED = 0x4000,  //  已经断开
+
+    STATUS_PROTOCOL_MASK = 0x000F,      //  协议状态掩码:  ***-****|****-XXXX
+    STATUS_PROTOCOL_IDLE = 0x0000,      //  等待认证
+    STATUS_PROTOCOL_WAITAUTH = 0x0001,  //  等待认证
+    STATUS_PROTOCOL_READY = 0x0002,     //  认证成功
+    STATUS_PROTOCOL_ERROR = 0x000F,     //  协议异常
 };
 
+enum : int32_t {
+    EVENT_CONN_INITED,
+    EVENT_CONN_STATUS_CHANGED,
+};
+
+
+struct SMQStream {
+    virtual void update_status(uint16_t mask, uint16_t val) = 0;
+    virtual uint16_t current_status(uint16_t mask) = 0;
+    //    virtual void async_write(MESSAGE* msg) = 0;
+};
+
+template <typename TRANSPORT, typename DISPATCHER, typename ALLOCATOR>
+class SMQProtocol
+{
+protected:
+    enum {
+        CONNAUTH = 1,
+        CONNAUTHACK = 2,
+    };
+    struct CONNHEAD {
+        uint16_t code;  //  type & length
+    };
+    struct CONNAUTHMsg : public CONNHEAD {
+        uint16_t source;
+    };
+
+    struct CONNAUTHACKMsg : public CONNHEAD {
+        uint16_t source;
+    };
+
+    void PostAuth(void* s)
+    {
+        SMQStream* stream = (SMQStream*)s;
+        //((TRANSPORT*)this)->debug(stream, "PostAuth");
+        MESSAGE* msg = allocator->Alloc(sizeof(MESSAGE) + sizeof(CONNAUTHMsg));
+        Q_ASSERT(nullptr != msg);
+        CONNAUTHMsg* auth = PayloadOf<CONNAUTHMsg*>(msg);
+        auth->code = CONNAUTH;
+        auth->source = ((TRANSPORT*)this)->source;
+        msg->TotalLength(sizeof(MESSAGE) + sizeof(CONNAUTHMsg));
+        msg->Type(MESSAGE::TYPE_CONN);
+
+        //        Q_ASSERT(nullptr == stream->wcur);
+        //        stream->wcur = BufferOf(msg);
+
+        //  启动异步发送
+        ((TRANSPORT*)this)->async_write(stream, msg);
+    }
+
+    void PostAuthAck(void* s)
+    {
+        SMQStream* stream = (SMQStream*)s;
+        //        ((TRANSPORT*)this)->debug(stream, "PostAuthAck");
+        MESSAGE* msg = allocator->Alloc(sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg));
+        Q_ASSERT(nullptr != msg);
+        CONNAUTHACKMsg* auth = PayloadOf<CONNAUTHACKMsg*>(msg);
+        auth->code = CONNAUTHACK;
+        auth->source = ((TRANSPORT*)this)->source;
+        msg->TotalLength(sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg));
+        msg->Type(MESSAGE::TYPE_CONN);
+
+        //        ((TRANSPORT*)this)->debug(stream, "assert pos");
+        //        Q_ASSERT(nullptr == stream->wcur);
+        //        stream->wcur = BufferOf(msg);
+
+        //  启动异步发送
+        ((TRANSPORT*)this)->async_write(stream, msg);
+    }
+
+    void HandleConnMessage(void* s, MESSAGE* msg)
+    {
+        SMQStream* stream = (SMQStream*)s;
+        Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNHEAD)));
+        CONNHEAD* head = PayloadOf<CONNHEAD*>(msg);
+        switch (head->code) {
+            case CONNAUTH: {
+                //                ((TRANSPORT*)this)->debug(stream, "Receive Auth");
+                Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNAUTHMsg)));
+                CONNAUTHMsg* req = PayloadOf<CONNAUTHMsg*>(msg);
+                Q_ASSERT(MESSAGE::ADDRESS_INVALID != req->source);
+                ((TRANSPORT*)this)->BindStreamChan(stream, req->source);
+                PostAuthAck(stream);
+                stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
+            } break;
+            case CONNAUTHACK: {
+                //                ((TRANSPORT*)this)->debug(stream, "Receive AuthAck");
+                Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg)));
+                CONNAUTHACKMsg* ack = PayloadOf<CONNAUTHACKMsg*>(msg);
+                Q_ASSERT(MESSAGE::ADDRESS_INVALID != ack->source);
+                ((TRANSPORT*)this)->BindStreamChan(stream, ack->source);
+                stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
+            } break;
+            default:
+                Q_ASSERT(false);
+        }
+    }
+
+    int Init(uint16_t selfid, DISPATCHER* disp, ALLOCATOR* alloc)
+    {
+        source = selfid;
+        dispatcher = disp;
+        allocator = alloc;
+        return 0;
+    }
+
+    virtual void HandleEvent(void* s, uint16_t event, uintptr_t param1, uintptr_t param2)
+    {
+        SMQStream* stream = (SMQStream*)s;
+        if (EVENT_CONN_INITED == event) {
+            stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_IDLE);
+        }
+
+        if (EVENT_CONN_STATUS_CHANGED == event) {
+            if ((param1 == STATUS_CONN_CONNECTING) && (param2 == STATUS_CONN_CONNECTED)) {
+                stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_WAITAUTH);
+                PostAuth(stream);
+            }
+        }
+    }
+
+    virtual void HandleMessage(void* s, MESSAGE* msg)
+    {
+        SMQStream* stream = (SMQStream*)(s);
+        switch (msg->Type()) {
+            case MESSAGE::TYPE_CONN:
+                HandleConnMessage(stream, msg);
+                break;
+            case MESSAGE::TYPE_USER:
+                dispatcher->HandleMessage(stream, msg);
+                break;
+            default:
+                Q_ASSERT(false);
+                break;
+        }
+    }
+
+protected:
+    uint16_t source;
+    DISPATCHER* dispatcher;
+    ALLOCATOR* allocator;
+};
+
+
 template <typename DISPATCHER, typename ALLOCATOR>
-class SMQTransport
+class SMQTransport : public SMQProtocol<SMQTransport<DISPATCHER, ALLOCATOR>, DISPATCHER, ALLOCATOR>
 {
 private:
-    enum : uint16_t {
-        STATUS_CONN_MASK = 0xF000,          //  连接状态掩码: XXXX-****|****-****
-        STATUS_CONN_IDLE = 0x0000,          //  已经断开
-        STATUS_CONN_CONNECTING = 0x1000,    //  正在连接
-        STATUS_CONN_CLEANING = 0x2000,      //  正在清理链接
-        STATUS_CONN_CONNECTED = 0x3000,     //  连接成功
-        STATUS_CONN_DISCONNECTED = 0x4000,  //  已经断开
-
-        STATUS_PROTOCOL_MASK = 0x000F,      //  协议状态掩码:  ***-****|****-XXXX
-        STATUS_PROTOCOL_IDLE = 0x0000,      //  等待认证
-        STATUS_PROTOCOL_WAITAUTH = 0x0001,  //  等待认证
-        STATUS_PROTOCOL_READY = 0x0002,     //  认证成功
-        STATUS_PROTOCOL_ERROR = 0x000F,     //  协议异常
-    };
-
-    enum : int32_t {
-        EVENT_CONN_STATUS_CHANGED,
-    };
-
     struct chan_t;
-    struct stream_t : public NODE {
+    struct stream_t : public NODE, public SMQStream {
         asio::ip::tcp::socket socket;
         chan_t* chan;     //  绑定到哪个通道
         BUFFER* wcur;     //  当前正在发送的消息(当wcur为null时,表示需要重启)
@@ -64,17 +198,17 @@ private:
             rcur = nullptr;
             wcur = nullptr;
             target = MESSAGE::ADDRESS_INVALID;
-            status = STATUS_CONN_IDLE | STATUS_PROTOCOL_IDLE;
+            status = STATUS_CONN_IDLE;
             rhead = true;
             wloss = true;
         }
 
-        void update_status(uint16_t mask, uint16_t val)
+        virtual void update_status(uint16_t mask, uint16_t val) override
         {
             status = (status & ~mask) | (val & mask);
         }
 
-        void current_status(uint16_t mask)
+        virtual uint16_t current_status(uint16_t mask) override
         {
             return (status & mask);
         }
@@ -91,6 +225,8 @@ private:
         }
     };
 
+    typedef SMQProtocol<SMQTransport<DISPATCHER, ALLOCATOR>, DISPATCHER, ALLOCATOR> PARENT;
+
 
 public:
     SMQTransport()
@@ -103,9 +239,14 @@ public:
         Q_ASSERT(nullptr != disp);
         Q_ASSERT(nullptr != alloc);
 
-        dispatcher = disp;
+        int ret = PARENT::Init(selfid, disp, alloc);
+        if (0 != ret) {
+            return -1;
+        }
+
+        //        dispatcher = disp;
         allocator = alloc;
-        source = selfid;
+        //        source = selfid;
 
         chans.resize(maxConn);
 
@@ -119,7 +260,9 @@ public:
 
         // asio::ip::tcp::socket;
         auto stream = new stream_t(std::move(asio::ip::tcp::socket(context)));
+
         padding.push_back(stream);
+        this->HandleEvent(stream, EVENT_CONN_INITED, 0, 0);
 
 
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTING);
@@ -170,9 +313,7 @@ public:
             //  如果当前处于写丢失状态,那么重启写操作
             if (stream->wloss) {
                 stream->wcur = (BUFFER*)(chan->qsend.pop_front());
-                if (nullptr != stream->wcur) {
-                    async_write(stream);
-                }
+                async_write(stream, MessageOf(stream->wcur));
             }
         }
         return 0;
@@ -183,7 +324,7 @@ public:
         context.run();
     }
 
-protected:
+public:
     void HandleConnectResult(stream_t* stream, const system::error_code& err, asio::ip::tcp::endpoint ep)
     {
         if (err) {
@@ -192,10 +333,10 @@ protected:
         }
         debug(stream, "HandleConnect success");
 
-        if (nullptr == stream->rcur) {
-            stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
-            Q_ASSERT(nullptr != stream->rcur);
-        }
+        //        if (nullptr == stream->rcur) {
+        //            stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
+        //            Q_ASSERT(nullptr != stream->rcur);
+        //        }
 
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTED);
         // stream->update_status(STATUS_CONN_MASK, STATUS_CONN_CONNECTED);
@@ -221,11 +362,12 @@ protected:
         auto stream = new stream_t(std::move(sock));
 
         padding.push_back(stream);
+        this->HandleEvent(stream, EVENT_CONN_INITED, 0, 0);
 
-        if (nullptr == stream->rcur) {
-            stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
-            Q_ASSERT(nullptr != stream->rcur);
-        }
+        //        if (nullptr == stream->rcur) {
+        //            stream->rcur = allocator->Alloc(MESSAGE::TOTAL_LENGTH_DEF);
+        //            Q_ASSERT(nullptr != stream->rcur);
+        //        }
 
         stream->rhead = true;
         async_read(stream);
@@ -254,7 +396,7 @@ protected:
             async_read(stream);
 
         } else {
-            HandleMessage(stream, stream->rcur);
+            this->HandleMessage((void*)stream, stream->rcur);
             stream->rcur = nullptr;
 
             stream->rhead = true;
@@ -338,15 +480,24 @@ protected:
         }
 
         //  启动异步发送
-        async_write(stream);
+        async_write(stream, MessageOf(stream->wcur));
 
         //  释放前一个消息
         allocator->Free(MessageOf(oldwcur));
     }
 
     //  启动异步发送
-    void async_write(stream_t* stream)
+    void async_write(void* s, MESSAGE* newmsg)
     {
+        stream_t* stream = (stream_t*)s;
+        if (nullptr != newmsg) {
+            stream->wcur = BufferOf(newmsg);
+        }
+
+        if (stream->wcur) {
+            stream->wloss = true;
+        }
+
         stream->wloss = false;
         Q_ASSERT(nullptr != stream->wcur);
         MESSAGE* msg = MessageOf(stream->wcur);
@@ -374,7 +525,8 @@ protected:
 
     int debug(stream_t* stream, const char* format, ...)
     {
-        std::printf("[%p][%d-%d]", stream, source, stream->target);
+        // std::printf("[%p][%d-%d]", stream, source, stream->target);
+        std::printf("[%p][??-%d]", stream, stream->target);
         va_list valist;
         va_start(valist, format);
         std::vprintf(format, valist);
@@ -393,94 +545,14 @@ protected:
         return &chans[id];
     }
 
-protected:
-    enum {
-        CONNAUTH = 1,
-        CONNAUTHACK = 2,
-    };
-    struct CONNHEAD {
-        uint16_t code;  //  type & length
-    };
-    struct CONNAUTHMsg : public CONNHEAD {
-        uint16_t source;
-    };
-
-    struct CONNAUTHACKMsg : public CONNHEAD {
-        uint16_t source;
-    };
-
-    void PostAuth(void* s)
+public:
+    void BindStreamChan(void* s, uint16_t target)
     {
         stream_t* stream = (stream_t*)s;
-        debug(stream, "PostAuth");
-        MESSAGE* msg = allocator->Alloc(sizeof(MESSAGE) + sizeof(CONNAUTHMsg));
-        Q_ASSERT(nullptr != msg);
-        CONNAUTHMsg* auth = PayloadOf<CONNAUTHMsg*>(msg);
-        auth->code = CONNAUTH;
-        auth->source = source;
-        msg->TotalLength(sizeof(MESSAGE) + sizeof(CONNAUTHMsg));
-        msg->Type(MESSAGE::TYPE_CONN);
+        chan_t* chan = ChanOf(target);
 
-        Q_ASSERT(nullptr == stream->wcur);
-        stream->wcur = BufferOf(msg);
+        stream->target = target;
 
-        //  启动异步发送
-        async_write(stream);
-    }
-
-    void PostAuthAck(void* s)
-    {
-        stream_t* stream = (stream_t*)s;
-        debug(stream, "PostAuthAck");
-        MESSAGE* msg = allocator->Alloc(sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg));
-        Q_ASSERT(nullptr != msg);
-        CONNAUTHACKMsg* auth = PayloadOf<CONNAUTHACKMsg*>(msg);
-        auth->code = CONNAUTHACK;
-        auth->source = source;
-        msg->TotalLength(sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg));
-        msg->Type(MESSAGE::TYPE_CONN);
-
-        debug(stream, "assert pos");
-        Q_ASSERT(nullptr == stream->wcur);
-        stream->wcur = BufferOf(msg);
-
-        //  启动异步发送
-        async_write(stream);
-    }
-
-    void HandleConnMessage(void* s, MESSAGE* msg)
-    {
-        stream_t* stream = (stream_t*)s;
-        Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNHEAD)));
-        CONNHEAD* head = PayloadOf<CONNHEAD*>(msg);
-        switch (head->code) {
-            case CONNAUTH: {
-                debug(stream, "Receive Auth");
-                Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNAUTHMsg)));
-                CONNAUTHMsg* req = PayloadOf<CONNAUTHMsg*>(msg);
-                Q_ASSERT(MESSAGE::ADDRESS_INVALID != req->source);
-                stream->target = req->source;
-                BindStreamChan(stream, ChanOf(stream->target));
-                PostAuthAck(stream);
-                stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
-            } break;
-            case CONNAUTHACK: {
-                debug(stream, "Receive AuthAck");
-                Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg)));
-                CONNAUTHACKMsg* ack = PayloadOf<CONNAUTHACKMsg*>(msg);
-                Q_ASSERT(MESSAGE::ADDRESS_INVALID != ack->source);
-                stream->target = ack->source;
-                BindStreamChan(stream, ChanOf(stream->target));
-                stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
-            } break;
-            default:
-                Q_ASSERT(false);
-        }
-    }
-
-    void BindStreamChan(void* s, chan_t* chan)
-    {
-        stream_t* stream = (stream_t*)s;
         stream->chan = chan;
         chan->stream = stream;
     }
@@ -493,46 +565,20 @@ protected:
         uint16_t newstatus = (stream->status & mask);
 
         if (oldstatus != newstatus) {
-            HandleEvent(stream, EVENT_CONN_STATUS_CHANGED, oldstatus, newstatus);
-        }
-    }
-
-    virtual void HandleEvent(void* s, uint16_t event, uintptr_t param1, uintptr_t param2)
-    {
-        stream_t* stream = (stream_t*)s;
-        if (EVENT_CONN_STATUS_CHANGED == event) {
-            if ((param1 == STATUS_CONN_CONNECTING) && (param2 == STATUS_CONN_CONNECTED)) {
-                stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_WAITAUTH);
-                PostAuth(stream);
-            }
-        }
-    }
-
-    virtual void HandleMessage(void* s, MESSAGE* msg)
-    {
-        stream_t* stream = (stream_t*)(s);
-        switch (msg->Type()) {
-            case MESSAGE::TYPE_CONN:
-                HandleConnMessage(stream, msg);
-                break;
-            case MESSAGE::TYPE_USER:
-                dispatcher->HandleMessage(stream, msg);
-                break;
-            default:
-                Q_ASSERT(false);
-                break;
+            this->HandleEvent(stream, EVENT_CONN_STATUS_CHANGED, oldstatus, newstatus);
         }
     }
 
 
 protected:
     asio::io_context context;           //  网络IO上下文, asio::io_context
-    DISPATCHER* dispatcher;             //  消息分发器
     ALLOCATOR* allocator;               //  消息对象分配器
     asio::ip::tcp::acceptor* acceptor;  //  连接器
     std::vector<chan_t> chans;          //  所有可能的流对象列表
     NODE padding;                       //  处于待命状态的连接
-    uint16_t source;                    //  源地址
+
+    //    DISPATCHER* dispatcher;             //  消息分发器
+    //    uint16_t source;                    //  源地址
 };
 
 #endif  // WECOMM_H
