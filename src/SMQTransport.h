@@ -59,7 +59,8 @@ struct SMQStream {
     virtual uint16_t current_status(uint16_t mask) const = 0;
     virtual uint16_t get_attr(uint16_t mask) const = 0;
     virtual uint16_t get_target() const = 0;
-    //    virtual void async_write(MESSAGE* msg) = 0;
+    virtual void try_reconnect() = 0;
+    virtual void disconnect() = 0;
 };
 
 static inline asio::ip::tcp::endpoint addr_of(const std::string& str)
@@ -139,7 +140,7 @@ protected:
         ((TRANSPORT*)this)->async_write(stream, msg);
     }
 
-    void HandleConnMessage(void* s, MESSAGE* msg)
+    int32_t HandleConnMessage(void* s, MESSAGE* msg)
     {
         SMQStream* stream = (SMQStream*)s;
         Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNHEAD)));
@@ -152,9 +153,13 @@ protected:
                 Q_ASSERT(MESSAGE::ADDRESS_INVALID != req->source);
                 int ret = ((TRANSPORT*)this)->BindStreamChan(stream, req->source);
                 if (0 != ret) {
+                    // stream->disconnect();
+                    return ACTION_DISCONNECT;
                 }
+
                 PostAuthAck(stream);
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
+                return ACTION_NONE;
             } break;
             case CONNAUTHACK: {
                 //                ((TRANSPORT*)this)->debug(stream, "Receive AuthAck");
@@ -163,11 +168,17 @@ protected:
                 Q_ASSERT(MESSAGE::ADDRESS_INVALID != ack->source);
                 int ret = ((TRANSPORT*)this)->BindStreamChan(stream, ack->source);
                 if (0 != ret) {
+                    // stream->disconnect();
+                    return ACTION_DISCONNECT;
                 }
+
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
+                return ACTION_NONE;
             } break;
-            default:
+            default: {
                 Q_ASSERT(false);
+                return ACTION_NONE;
+            } break;
         }
     }
 
@@ -179,13 +190,13 @@ protected:
         return 0;
     }
 
-    virtual void HandleEvent(void* s, uint32_t& action, uint16_t event, uintptr_t param1, uintptr_t param2)
+    virtual int32_t HandleEvent(void* s, uint16_t event, uintptr_t param1, uintptr_t param2)
     {
         std::printf("HandleEvent: event=%d, [%llu, %llu]\n", event, param1, param2);
         SMQStream* stream = (SMQStream*)s;
         if (EVENT_CONN_INITED == event) {
             stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_IDLE);
-            return;
+            return ACTION_NONE;
         }
 
         if (EVENT_STATUS_CHANGED == event) {
@@ -195,37 +206,41 @@ protected:
             if ((conn_status_old == STATUS_CONN_CONNECTING) && (conn_status_new == STATUS_CONN_CONNECTED)) {
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_WAITAUTH);
                 PostAuth(stream);
-                return;
+                return ACTION_NONE;
             }
 
             if ((conn_status_old != STATUS_CONN_DISCONNECTED) && (conn_status_new == STATUS_CONN_DISCONNECTED)) {
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_IDLE);
                 if (ATTR_STREAM_TYPE_ACTIVATE == stream->get_attr(ATTR_STREAM_TYPE_MASK)) {
-                    action = ACTION_RECONNECT;
+                    // stream->try_reconnect();
                     std::printf("Disconnected, try reconnect\n");
+                    return ACTION_RECONNECT;
                 } else {
-                    action = ACTION_DISCONNECT;
+                    // stream->disconnect();
+                    return ACTION_DISCONNECT;
                 }
-                return;
+                return ACTION_NONE;
             }
         }
+
+        return ACTION_NONE;
     }
 
-    virtual void HandleMessage(void* s, MESSAGE* msg)
+    virtual int32_t HandleMessage(void* s, MESSAGE* msg)
     {
         SMQStream* stream = (SMQStream*)(s);
         switch (msg->Type()) {
             case MESSAGE::TYPE_CONN:
-                HandleConnMessage(stream, msg);
-                break;
+                return HandleConnMessage(stream, msg);
             case MESSAGE::TYPE_USER:
                 msg->Source(stream->get_target());
                 msg->Target(source);
-                dispatcher->HandleMessage(stream, msg);
-                break;
+                return dispatcher->HandleMessage(stream, msg);
             default:
+                //  未被处理时,直接释放掉
                 Q_ASSERT(false);
-                break;
+                allocator->Free(msg);
+                return ACTION_NONE;
         }
     }
 
@@ -243,6 +258,7 @@ private:
     struct chan_t;
     struct stream_t : public NODE, public SMQStream {
         asio::ip::tcp::socket socket;
+        SMQTransport* transport;
         chan_t* chan;     //  绑定到哪个通道
         BUFFER* wcur;     //  当前正在发送的消息(当wcur为null时,表示需要重启)
         MESSAGE* rcur;    //  当前还未收取完成的消息
@@ -254,10 +270,12 @@ private:
         uint16_t status;  //  当前状态
         std::string targetAddr;
         asio::deadline_timer* timer;
+        int32_t action;
 
-        stream_t(asio::ip::tcp::socket sock, const std::string& addr, uint16_t attr = 0)
+        stream_t(SMQTransport* t, asio::ip::tcp::socket sock, const std::string& addr, uint16_t attr = 0)
             : socket(std::move(sock)), attr(attr)
         {
+            transport = t;
             chan = nullptr;
             rcur = nullptr;
             wcur = nullptr;
@@ -267,6 +285,7 @@ private:
             wloss = true;
             targetAddr = addr;
             timer = nullptr;
+            action = ACTION_NONE;
         }
 
         virtual void update_status(uint16_t mask, uint16_t val) override
@@ -287,6 +306,16 @@ private:
         virtual uint16_t get_target() const
         {
             return target;
+        }
+
+        virtual void try_reconnect()
+        {
+            action = ACTION_RECONNECT;
+        }
+
+        virtual void disconnect()
+        {
+            action = ACTION_DISCONNECT;
         }
     };
 
@@ -333,13 +362,12 @@ public:
     int SetupConnect(const std::string& saddr)
     {
         // asio::ip::tcp::socket;
-        auto stream = new stream_t(std::move(asio::ip::tcp::socket(context)), saddr, ATTR_STREAM_TYPE_ACTIVATE);
+        auto stream = new stream_t(this, std::move(asio::ip::tcp::socket(context)), saddr, ATTR_STREAM_TYPE_ACTIVATE);
 
         asio::ip::tcp::resolver resolver(context);
         auto endpoints = resolver.resolve(std::string("localhost"), std::string("9090"));
         padding.push_back(stream);
-        uint32_t action = ACTION_NONE;
-        this->HandleEvent(stream, action, EVENT_CONN_INITED, 0, 0);
+        this->HandleEvent(stream, EVENT_CONN_INITED, 0, 0);
 
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTING);
 
@@ -465,11 +493,10 @@ public:
             saddr = str_of(endpoint);
         }
 
-        auto stream = new stream_t(std::move(sock), saddr, ATTR_STREAM_TYPE_PASSIVES);
+        auto stream = new stream_t(this, std::move(sock), saddr, ATTR_STREAM_TYPE_PASSIVES);
 
         padding.push_back(stream);
-        uint32_t action = ACTION_NONE;
-        this->HandleEvent(stream, action, EVENT_CONN_INITED, 0, 0);
+        this->HandleEvent(stream, EVENT_CONN_INITED, 0, 0);
 
         stream->rhead = true;
         async_read(stream);
@@ -506,11 +533,21 @@ public:
             async_read(stream);
 
         } else {
-            this->HandleMessage((void*)stream, stream->rcur);
-            stream->rcur = nullptr;
-
-            stream->rhead = true;
-            async_read(stream);
+            int32_t action = this->HandleMessage((void*)stream, stream->rcur);
+            switch (action) {
+                case ACTION_NONE:
+                    stream->rcur = nullptr;
+                    stream->rhead = true;
+                    async_read(stream);
+                    break;
+                case ACTION_DISCONNECT:
+                    stream->socket.close();
+                    break;
+                case ACTION_RECONNECT:
+                    stream->socket.close();
+                    async_connect(stream);
+                    break;
+            }
         }
     }
 
@@ -602,8 +639,7 @@ public:
         auto endpoints = resolver.resolve(std::string("localhost"), std::string("9090"));
 
         padding.push_back(stream);
-        uint32_t action = ACTION_NONE;
-        this->HandleEvent(stream, action, EVENT_CONN_INITED, 0, 0);
+        this->HandleEvent(stream, EVENT_CONN_INITED, 0, 0);
 
         UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_CONNECTING);
 
@@ -661,14 +697,15 @@ public:
         uint16_t newstatus = stream->status;
 
         if (oldstatus != newstatus) {
-            uint32_t action = ACTION_NONE;
-            this->HandleEvent(stream, action, EVENT_STATUS_CHANGED, oldstatus, newstatus);
+            int32_t action = this->HandleEvent(stream, EVENT_STATUS_CHANGED, oldstatus, newstatus);
             if (action == ACTION_DISCONNECT) {
                 stream->socket.close();
+                return;
             }
             if (action == ACTION_RECONNECT) {
                 stream->socket.close();
                 async_connect(stream);
+                return;
             }
         }
     }

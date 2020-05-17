@@ -9,14 +9,16 @@ class WeProtocol
 {
     // Dispatch interface
 public:
-    virtual void HandleEvent(void* stream, uint16_t event, uintptr_t param1, uintptr_t param2)
-    {
-    }
-    virtual void HandleMessage(void* stream, MESSAGE* msg)
+    //    virtual void HandleEvent(void* stream, uint16_t event, uintptr_t param1, uintptr_t param2)
+    //    {
+    //    }
+    virtual int32_t HandleMessage(void* stream, MESSAGE* msg)
     {
         WeHello* hello = PayloadOf<WeHello*>(msg);
 
         printf("WeDispatch::Handle: '%s'\n", hello->str);
+
+        return ACTION_NONE;
     }
 };
 
@@ -65,7 +67,6 @@ int main(int argc, char* argv[])
         printf("Enter to send test message...\n");
         getchar();
 
-
         MESSAGE* msg = allocator.Alloc(sizeof(WeHello));
         msg->Type(MESSAGE::TYPE_USER);
         WeHello* hello = PayloadOf<WeHello*>(msg);
@@ -75,6 +76,7 @@ int main(int argc, char* argv[])
         msg->Target(target);
         comm->Post(msg);
     }
+
 
     printf("Enter to exit...\n");
     getchar();
