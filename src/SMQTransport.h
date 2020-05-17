@@ -43,7 +43,7 @@ enum : uint16_t {
 
 enum : int32_t {
     EVENT_CONN_INITED,
-    EVENT_CONN_STATUS_CHANGED,
+    EVENT_STATUS_CHANGED,
 };
 
 enum : int32_t {
@@ -58,6 +58,7 @@ struct SMQStream {
     virtual void update_status(uint16_t mask, uint16_t val) = 0;
     virtual uint16_t current_status(uint16_t mask) const = 0;
     virtual uint16_t get_attr(uint16_t mask) const = 0;
+    virtual uint16_t get_target() const = 0;
     //    virtual void async_write(MESSAGE* msg) = 0;
 };
 
@@ -149,7 +150,9 @@ protected:
                 Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNAUTHMsg)));
                 CONNAUTHMsg* req = PayloadOf<CONNAUTHMsg*>(msg);
                 Q_ASSERT(MESSAGE::ADDRESS_INVALID != req->source);
-                ((TRANSPORT*)this)->BindStreamChan(stream, req->source);
+                int ret = ((TRANSPORT*)this)->BindStreamChan(stream, req->source);
+                if (0 != ret) {
+                }
                 PostAuthAck(stream);
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
             } break;
@@ -158,7 +161,9 @@ protected:
                 Q_ASSERT(msg->TotalLength() >= (sizeof(MESSAGE) + sizeof(CONNAUTHACKMsg)));
                 CONNAUTHACKMsg* ack = PayloadOf<CONNAUTHACKMsg*>(msg);
                 Q_ASSERT(MESSAGE::ADDRESS_INVALID != ack->source);
-                ((TRANSPORT*)this)->BindStreamChan(stream, ack->source);
+                int ret = ((TRANSPORT*)this)->BindStreamChan(stream, ack->source);
+                if (0 != ret) {
+                }
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_READY);
             } break;
             default:
@@ -180,15 +185,20 @@ protected:
         SMQStream* stream = (SMQStream*)s;
         if (EVENT_CONN_INITED == event) {
             stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_IDLE);
+            return;
         }
 
-        if (EVENT_CONN_STATUS_CHANGED == event) {
-            if ((param1 == STATUS_CONN_CONNECTING) && (param2 == STATUS_CONN_CONNECTED)) {
+        if (EVENT_STATUS_CHANGED == event) {
+            uint16_t conn_status_old = param1 & STATUS_CONN_MASK;
+            uint16_t conn_status_new = param2 & STATUS_CONN_MASK;
+
+            if ((conn_status_old == STATUS_CONN_CONNECTING) && (conn_status_new == STATUS_CONN_CONNECTED)) {
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_WAITAUTH);
                 PostAuth(stream);
+                return;
             }
 
-            if ((param1 != STATUS_CONN_DISCONNECTED) && (param2 == STATUS_CONN_DISCONNECTED)) {
+            if ((conn_status_old != STATUS_CONN_DISCONNECTED) && (conn_status_new == STATUS_CONN_DISCONNECTED)) {
                 stream->update_status(STATUS_PROTOCOL_MASK, STATUS_PROTOCOL_IDLE);
                 if (ATTR_STREAM_TYPE_ACTIVATE == stream->get_attr(ATTR_STREAM_TYPE_MASK)) {
                     action = ACTION_RECONNECT;
@@ -196,6 +206,7 @@ protected:
                 } else {
                     action = ACTION_DISCONNECT;
                 }
+                return;
             }
         }
     }
@@ -208,6 +219,8 @@ protected:
                 HandleConnMessage(stream, msg);
                 break;
             case MESSAGE::TYPE_USER:
+                msg->Source(stream->get_target());
+                msg->Target(source);
                 dispatcher->HandleMessage(stream, msg);
                 break;
             default:
@@ -240,7 +253,7 @@ private:
         uint16_t target;  //  流的目的地址
         uint16_t status;  //  当前状态
         std::string targetAddr;
-        boost::asio::deadline_timer* timer;
+        asio::deadline_timer* timer;
 
         stream_t(asio::ip::tcp::socket sock, const std::string& addr, uint16_t attr = 0)
             : socket(std::move(sock)), attr(attr)
@@ -270,6 +283,11 @@ private:
         {
             return (attr & mask);
         }
+
+        virtual uint16_t get_target() const
+        {
+            return target;
+        }
     };
 
     struct chan_t : public NODE {
@@ -280,6 +298,7 @@ private:
         chan_t()
         {
             stream = nullptr;
+            size = 0;
         }
     };
 
@@ -342,7 +361,7 @@ public:
         asio::ip::tcp::acceptor* accept = nullptr;
         try {
             accept = new asio::ip::tcp::acceptor(context, *endpoints.begin());
-        } catch (boost::system::system_error err) {
+        } catch (system::system_error err) {
             std::printf("Listen port '%s' failed: %s\n", saddr.c_str(), err.what());
             return -1;
         }
@@ -402,12 +421,12 @@ public:
             debug(stream, "%p:HandleConnect failed:%d: %s", stream, err.value(),
                   err.message().c_str());  // TODO 错误码是啥
             if (nullptr == stream->timer) {
-                // stream->timer = new boost::asio::deadline_timer(context, boost::posix_time::seconds(5));
-                stream->timer = new boost::asio::deadline_timer(context);
+                // stream->timer = new asio::deadline_timer(context, posix_time::seconds(5));
+                stream->timer = new asio::deadline_timer(context);
             }
 
-            stream->timer->expires_from_now(boost::posix_time::seconds(5));
-            stream->timer->async_wait([this, stream](boost::system::error_code err) {
+            stream->timer->expires_from_now(posix_time::seconds(5));
+            stream->timer->async_wait([this, stream](system::error_code err) {
                 std::printf("timeout - try reconnnect\n");
                 stream->timer->cancel();
                 this->async_connect(stream);
@@ -417,7 +436,7 @@ public:
         debug(stream, "HandleConnect success: %s", ep.address().to_string().c_str());
 
         if (nullptr != stream->timer) {
-            boost::asio::deadline_timer* timer = stream->timer;
+            asio::deadline_timer* timer = stream->timer;
             // stream->timer = nullptr;
             timer->cancel();
             // delete timer;
@@ -463,7 +482,7 @@ public:
 
     void HandleReadResult(stream_t* stream, const system::error_code& err, std::size_t length)
     {
-        if ((boost::asio::error::eof == err) || (boost::asio::error::connection_reset == err)) {
+        if ((asio::error::eof == err) || (asio::error::connection_reset == err)) {
             debug(stream, "HandleReadResult failed:%d: %s", err.value(), err.message().c_str());  // TODO 错误码是啥
             UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_DISCONNECTED);
             return;
@@ -497,7 +516,7 @@ public:
 
     void HandleWriteResult(stream_t* stream, const system::error_code& err, std::size_t length)
     {
-        if ((boost::asio::error::eof == err) || (boost::asio::error::connection_reset == err)) {
+        if ((asio::error::eof == err) || (asio::error::connection_reset == err)) {
             debug(stream, "HandleWriteResult failed:%d: %s", err.value(), err.message().c_str());  // TODO 错误码是啥
             UpdateStatus(stream, STATUS_CONN_MASK, STATUS_CONN_DISCONNECTED);
             return;
@@ -555,7 +574,7 @@ public:
         MESSAGE* msg = MessageOf(stream->wcur);
         asio::async_write(
             stream->socket, asio::buffer(msg, msg->TotalLength()),
-            [this, stream](boost::system::error_code ec, std::size_t len) { HandleWriteResult(stream, ec, len); });
+            [this, stream](system::error_code ec, std::size_t len) { HandleWriteResult(stream, ec, len); });
     }
 
     //  启动异步发送
@@ -563,13 +582,13 @@ public:
     {
         if (true == stream->rhead) {
             asio::async_read(stream->socket, asio::buffer(&(stream->rbuf), sizeof(stream->rbuf)),
-                             [this, stream](const boost::system::error_code& ec, std::size_t length) {
+                             [this, stream](const system::error_code& ec, std::size_t length) {
                                  HandleReadResult(stream, ec, length);
                              });
         } else {
             asio::async_read(stream->socket,
                              asio::buffer(stream->rcur->payload, (stream->rcur->TotalLength() - sizeof(MESSAGE))),
-                             [this, stream](const boost::system::error_code& ec, std::size_t length) {
+                             [this, stream](const system::error_code& ec, std::size_t length) {
                                  HandleReadResult(stream, ec, length);
                              });
         }
@@ -619,27 +638,31 @@ public:
     }
 
 public:
-    void BindStreamChan(void* s, uint16_t target)
+    int BindStreamChan(void* s, uint16_t target)
     {
         stream_t* stream = (stream_t*)s;
         chan_t* chan = ChanOf(target);
+        if (nullptr != chan->stream) {
+            return -1;
+        }
 
         stream->target = target;
 
         stream->chan = chan;
         chan->stream = stream;
+        return 0;
     }
 
     virtual void UpdateStatus(void* s, uint16_t mask, uint16_t val)
     {
         stream_t* stream = (stream_t*)s;
-        uint16_t oldstatus = (stream->status & mask);
+        uint16_t oldstatus = stream->status;
         stream->update_status(mask, val);
-        uint16_t newstatus = (stream->status & mask);
+        uint16_t newstatus = stream->status;
 
         if (oldstatus != newstatus) {
             uint32_t action = ACTION_NONE;
-            this->HandleEvent(stream, action, EVENT_CONN_STATUS_CHANGED, oldstatus, newstatus);
+            this->HandleEvent(stream, action, EVENT_STATUS_CHANGED, oldstatus, newstatus);
             if (action == ACTION_DISCONNECT) {
                 stream->socket.close();
             }
